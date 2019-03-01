@@ -1,6 +1,6 @@
-FROM jfrog.local:5002/ubuntu:latest
+FROM 172.16.134.151:8081/zhouyang_docker_virtual/ubuntu:latest
 
-MAINTAINER Stanley Fong stanleyf@jfrog.com
+MAINTAINER zhouyang
 
 RUN /bin/bash -c cd ~; cd /home ; mkdir -p exec
 ADD jdk/jdk-8-linux-x64.tar.gz /home/exec
