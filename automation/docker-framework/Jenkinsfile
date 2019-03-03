@@ -1,33 +1,48 @@
 #!/usr/bin/env groovy
 
 node ('master') {
-    git url: 'https://github.com/jfrogtraining/swampup'
-    def rtServer = Artifactory.newServer url: SERVER_URL, credentialsId: CREDENTIALS
+    def server = Artifactory.newServer url: SERVER_URL, credentialsId: CREDENTIALS
+    stage ('check code'){
+        git url: 'https://github.com/ivanzhouyang/project-examples.git'
+    }
+    
+    stage ('Build and push war'){
+        def rtMaven = Artifactory.newMavenBuild()
+        def buildInfo = Artifactory.newBuildInfo()
+        def Java_home=tool name: 'jdk1.8', type: 'jdk'
+        env.JAVA_HOME=Java_home
+        rtMaven.resolver server: server, releaseRepo: 'zhouyang-release-lib-vir', snapshotRepo: 'zhouyang-snapshot-lib-vir'
+        rtMaven.deployer server: server, releaseRepo: 'zhouyang-local-release', snapshotRepo: 'zhouyang-local-snapshot'
+        rtMaven.tool = 'maven'
+        rtMaven.run pom: 'maven-example/pom.xml', goals: 'clean install', buildInfo: buildInfo
+    }
+
+//Clone example project from GitHub repository
+    git url: 'https://github.com/ivanzhouyang/swampup.git', branch: 'master'
+    def rtServer = Artifactory.server SERVER_ID
     def buildInfo = Artifactory.newBuildInfo()
     def tagName
     buildInfo.env.capture = true
-
-    stage('Dependencies') {
+    
+//Fetch all depensencies from Artifactory
+    stage('image Dependencies') {
         dir('automation/docker-framework') {
             try {
                 println "Gather Java and Tomcat"
-
-                def downloadFrameworkSpec = readFile "${env.WORKSPACE}/automation/docker-framework/framework-download.json"
-
                 def downloadSpec = """{
-                         "files": [
-                          {
-                           "pattern": "tomcat-local/java/jdk-8u91-linux-x64.tar.gz",
-                           "target": "jdk/jdk-8-linux-x64.tar.gz",
-                           "flat":"true"
-                          },
-                          {
-                           "pattern": "tomcat-local/org/apache/apache-tomcat/apache-tomcat-8.0.32.tar.gz",
-                           "target": "tomcat/apache-tomcat-8.tar.gz",
-                           "flat":"true"
-                          }
-                          ]
-                        }"""
+                    "files": [
+                        {
+                            "pattern": "zhouyang_generic/jdk-8u201-linux-x64.tar",
+                            "target": "jdk/jdk-8-linux-x64.tar.gz",
+                            "flat":"true"
+                        },
+                        {
+                            "pattern": "zhouyang_generic/apache-tomcat-8.0.36.tar",
+                            "target": "tomcat/apache-tomcat-8.tar.gz",
+                            "flat":"true"
+                        }
+                    ]
+                }"""
 
                 rtServer.download (downloadSpec, buildInfo)
                 if (fileExists('jdk/jdk-8-linux-x64.tar.gz') && fileExists('tomcat/apache-tomcat-8.tar.gz')) {
@@ -43,66 +58,42 @@ node ('master') {
             }
         }
     }
-    stage('build') {
+
+//#######################################    
+    stage('image Build') {
         dir ('automation/docker-framework') {
             withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: CREDENTIALS, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
                     def rtDocker = Artifactory.docker server: rtServer
-                    tagName = "${ARTDOCKER_REGISTRY}/docker-framework:${env.BUILD_NUMBER}"
+                    tagName = "${ARTDOCKER_REGISTRY}/docker-framework:${env.BUILD_NUMBER}"                    
+                    def curlstr = "curl -u " + env.USERNAME + ":" + env.PASSWORD + " " + SERVER_URL
+                    def warverstr=curlstr+ "api/search/latestVersion?g=org.jfrog.test&a=multi3&repos=zhouyang-local-snapshot"
+                    sh warverstr +' > war/version.txt'
+                    env.WARVER=readFile('war/version.txt')
+                    def downloadSpec = """{
+                       "files": [
+                           {
+                               "pattern": "zhouyang-local-snapshot/org/jfrog/test/multi3/"""+env.WARVER+"""/*.war",
+                               "target": "war/webservice.war",
+                                "flat":"true"
+                           }
+                          ]
+                        }"""    
+                   
+                    println(downloadSpec)
+                   rtServer.download(downloadSpec, buildInfo)
+
                     docker.build(tagName)
-                    rtDocker.push(tagName, REPO, buildInfo)
+                    echo tagName
+                    sleep 6
+                    rtDocker.push(tagName,REPO, buildInfo)
+                    sleep 2
                     rtServer.publishBuildInfo buildInfo
             }
         }
-    }
+}
 
-    stage('test') {
-        dir('automation/docker-framework/framework-test') {
-            def gradleWarDownload1 = readFile "${env.WORKSPACE}/automation/docker-framework/gradeWar-download.json"
 
-            def gradleWarDownload = """{
-            "files": [
-                {
-                  "pattern": "gradle-release-local/org/jfrog/example/gradle/webservice/1.1.2/*.war",
-                  "target": "war/webservice.war",
-                  "props": "unit-test=pass",
-                  "flat": "true"
-                }
-              ]
-            }"""
-
-            rtServer.download(gradleWarDownload)
-            updateDockerFile()
-            def tagDockerFramework = "${ARTDOCKER_REGISTRY}/docker-framework-test:${env.BUILD_NUMBER}"
-            docker.build(tagDockerFramework)
-            if (testFramework(tagDockerFramework)) {
-                println "Setting property and promotion"
-                updateProperty ("qa.functional-test=pass")
-                sh "docker rmi ${tagName}"
-            } else {
-                updateProperty ("qa.functional-test=fail; qa.failed-test=page-not-loaded")
-                currentBuild.result = 'UNSTABLE'
-                sh "docker rmi ${tagName}"
-                return
-            }
-        }
-    }
-
-    stage('Xray Scan') {
-        if (XRAY_SCAN == "YES") {
-            def xrayConfig = [
-                'buildName'     : env.JOB_NAME,
-                'buildNumber'   : env.BUILD_NUMBER,
-                'failBuild'     : false
-            ]
-            def xrayResults = rtServer.xrayScan xrayConfig
-            echo xrayResults as String
-        } else {
-            println "No Xray scan performed. To enable set XRAY_SCAN = YES"
-        }
-        //sleep 60
-    }
-
-    stage ('promote') {
+stage ('image Promote') {
         dir ('automation/docker-framework') {
             def promotionConfig = [
               'buildName'          : env.JOB_NAME,
@@ -114,17 +105,30 @@ node ('master') {
               'includeDependencies': false,
               'copy'               : true
             ]
+            
+            echo promotionConfig as String
             rtServer.promote promotionConfig
             reTagLatest (SOURCE_REPO)
             reTagLatest (PROMOTE_REPO)
          }
     }
+
+
+stage('image deployment'){
+         
+              println("deploy docker")
+              println("deploy docker-framework image")
+              sh "ansible zhouyang -m command -a 'docker stop docker-framework'"
+              sh "ansible zhouyang -m command -a 'docker rm docker-framework'"
+              sh "ansible zhouyang -m command -a 'docker rmi zhouyang-docker.zyartifactory/docker-framework:latest'"
+              sh "ansible zhouyang -m command -a 'docker run -d --name docker-framework -p 19999:8181 zhouyang-docker.zyartifactory/docker-framework:latest'"
+            }
 }
 
-def updateDockerFile () {
-    def BUILD_NUMBER = env.BUILD_NUMBER
-    sh 'sed -i "s/docker-framework:latest/docker-framework:$BUILD_NUMBER/" Dockerfile'
-}
+
+//*****************************************
+
+
 
 def reTagLatest (targetRepo) {
      def BUILD_NUMBER = env.BUILD_NUMBER
@@ -134,7 +138,10 @@ def reTagLatest (targetRepo) {
               sh 'sed -E "s/TARGETREPO/${PROMOTE_REPO}/" retag_out.json > retaga_out.json'
               break
           case SOURCE_REPO :
+               sh 'cat retag_out.json'
+               sh 'SOURCE_REPO=$(echo $SOURCE_REPO)'
                sh 'sed -E "s/TARGETREPO/${SOURCE_REPO}/" retag_out.json > retaga_out.json'
+
                break
       }
       sh 'cat retaga_out.json'
@@ -144,29 +151,4 @@ def reTagLatest (targetRepo) {
           println "Curl String is " + regTagStr
           sh regTagStr
       }
-}
-
-def testFramework (tag) {
-    def result = true
-    docker.image(tag).withRun('-p 8181:8181') {c ->
-        sleep 10
-        def stdout = sh(script: 'curl "http://localhost:8181/swampup/"', returnStdout: true)
-        if (stdout.contains("Welcome Docker Lifecycle Training")) {
-            println "*** Passed Test: " + stdout
-        } else {
-            println "*** Failed Test: " + stdout
-            result = false
-        }
-    }
-    sh "docker rmi ${tag}"
-    return result
-}
-
-def updateProperty (property) {
-    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: CREDENTIALS, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
-            def curlString = "curl -u " + env.USERNAME + ":" + env.PASSWORD + " " + "-X PUT " + SERVER_URL
-            def updatePropStr = curlString +  "/api/storage/${SOURCE_REPO}/docker-framework/${env.BUILD_NUMBER}?properties=${property}"
-            println "Curl String is " + updatePropStr
-            sh updatePropStr
-     }
 }
